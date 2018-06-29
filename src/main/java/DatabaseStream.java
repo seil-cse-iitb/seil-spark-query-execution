@@ -1,6 +1,7 @@
 import handler.LogHandler;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.functions;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
@@ -18,8 +19,8 @@ import static org.apache.spark.sql.functions.*;
 public class DatabaseStream {
 
 
-    private Dataset dataset;
-    private Dataset slidingDataset;
+    private Dataset<Row> dataset;
+    private Dataset<Row> slidingDataset;
     private String windowDuration;
     private String slidingDuration;
     private String timeField;
@@ -57,7 +58,7 @@ public class DatabaseStream {
      * At a specific time, current stream can have max ($noOfWindowToFetchAtOnce + 1) * $windowDuration of data.
      *
      * When I give you $queryTime which is $fetchNextWindowsAfterInPercent% percent of the last window available in stream
-     * i.e. ($currentStreamEndTime - $queryTime) >= ($fetchNextWindowsAfterInPercent / 100 * $windowDuration)
+     * i.e. (($currentStreamEndTime - $queryTime) <= ((100 - fetchNextWindowsAfterInPercent) / 100 * $windowDurationInSeconds))
      * then fetch the next $noOfWindowToFetchAtOnce windows and union it with $dataset. Also update $currentStreamEndTime as described above.
      *
      * Delete a $windowDuration data when all the data of that window is consumed. i.e. delete $currentStartTime to $currentStartTime + $windowDuration data if $queryTime is > $currentStartTime + $windowDuration and shift $currentStartTime = $currentStartTime + $windowDuration
@@ -67,7 +68,7 @@ public class DatabaseStream {
      *
      */
 
-    public DatabaseStream(Dataset dataset, String windowDuration, String slidingDuration, String timeField, int noOfWindowToFetchAtOnce, Column expr, Column[] exprs, Column[] groupByColumns, double streamStartTime, double fetchNextWindowsAfterInPercent) throws Exception {
+    public DatabaseStream(Dataset<Row> dataset, String windowDuration, String slidingDuration, String timeField, int noOfWindowToFetchAtOnce, Column expr, Column[] exprs, List<Column> groupByColumns, double streamStartTime, double fetchNextWindowsAfterInPercent) throws Exception {
         this.dataset = dataset;
         this.windowDuration = windowDuration;
         this.slidingDuration = slidingDuration;
@@ -75,7 +76,6 @@ public class DatabaseStream {
         this.noOfWindowToFetchAtOnce = noOfWindowToFetchAtOnce;
         this.expr = expr;
         this.exprs = exprs;
-        this.groupByColumns = groupByColumns;
         this.streamStartTime = streamStartTime;
         this.fetchNextWindowsAfterInPercent = fetchNextWindowsAfterInPercent;
 //some variable intialisation
@@ -83,16 +83,12 @@ public class DatabaseStream {
         this.slidingDurationInSeconds = toSeconds(slidingDuration);
         this.timestamp = functions.col(timeField).cast(DataTypes.LongType).cast(DataTypes.TimestampType).as("eventTime");
 //some initial calculation
-        ArrayList<Column> columns;
-        if (this.groupByColumns != null) {
-            columns = (ArrayList<Column>) Arrays.asList(this.groupByColumns);
-        } else {
-            this.groupByColumns = new Column[1];
-            columns = new ArrayList<Column>();
+        if (groupByColumns == null) {
+            groupByColumns = new ArrayList<Column>();
         }
-
-        columns.add(functions.window(this.timestamp, this.windowDuration, this.slidingDuration));
-        columns.toArray(this.groupByColumns);
+        groupByColumns.add(functions.window(this.timestamp, this.windowDuration, this.slidingDuration));
+        this.groupByColumns = new Column[groupByColumns.size()];
+        groupByColumns.toArray(this.groupByColumns);
 
         if (this.expr == null) {
             throw new Exception("[MyException][expr can't be null]");
@@ -113,39 +109,71 @@ public class DatabaseStream {
         currentStreamStartTimeStr = dateFormatter(currentStreamStartTime);
         currentStreamEndTimeStr = dateFormatter(currentStreamEndTime);
 
-        dataset = dataset.where(timeField + ">=" + currentStreamStartTime + " and " + timeField + "<" + currentStreamEndTime);
+        Dataset<Row> dataset = this.dataset.where(timeField + ">=" + currentStreamStartTime + " and " + timeField + "<" + currentStreamEndTime);
         if (exprs == null)
             slidingDataset = dataset.groupBy(groupByColumns).agg(expr);
         else
             slidingDataset = dataset.groupBy(groupByColumns).agg(expr, exprs);
-        slidingDataset = slidingDataset.where(col("window.start").$greater$eq(currentStreamStartTimeStr).
-                and(col("window.end").$less(currentStreamEndTimeStr)));
+        slidingDataset = slidingDataset.where(col("window.start").$greater$eq(currentStreamStartTimeStr)
+                .and(col("window.end").$less(currentStreamEndTimeStr)));
 
-//        slidingDataset.show(200, false);
-        LogHandler.logInfo("Initial Sliding Dataset Count:" + slidingDataset.count());
+        LogHandler.logInfo("[InitialSlidingDataset][currentStreamStartTime:" + currentStreamStartTimeStr + "][currentStreamEndTime:" + currentStreamEndTimeStr + "]");
         return slidingDataset;
     }
 
-    private Dataset startStream(Column expr, Column[] exprs, Column[] groupByColumns) throws Exception {
-        /*
-         * This will fetch 2 windowDuration of data from TS >= streamStartTime.
-         * Convert that 2 windowDuration of data into grouped by Columns... passed as parameters
-         * and (window with windowDuration and slidingDuration)
-         */
-        dataset = dataset.where(timeField + ">=" + streamStartTime + " and " + timeField + "<" + (streamStartTime + (noOfWindowToFetchAtOnce + 1) * toSeconds(windowDuration)));
-        List<Column> columns = Arrays.asList(groupByColumns);
-        columns.add(functions.window(this.timestamp, windowDuration, slidingDuration));
-        slidingDataset = dataset.groupBy((Column[]) columns.toArray()).agg(expr, exprs);
+    public Row[] getAggregatedRows(long queryTime) {//queryTime in seconds
+        //should be a atomic function (if different threads access the same object of DatabaseStream at same time than it might give faulty results)
+        LogHandler.logInfo("[QueryTime]" + dateFormatter(queryTime));
 
-        slidingDataset.show();
-        return slidingDataset;
+        Row[] collect = (Row[]) this.slidingDataset.where(col("window.start").equalTo(dateFormatter(queryTime))).collect();
+
+        this.lastQueryTime = queryTime;
+
+        fetchNextWindow();
+        deletePreviousWindow();
+
+        return collect;
     }
 
+    private void deletePreviousWindow() {
+        //currently optimised for space. Can be optimised for time by not deleting a $windowDuration data instead delete
+        // $noOfWindowToFetchAtOnce $windowDuration data at once
+        if (lastQueryTime >= (currentStreamStartTime + windowDurationInSeconds)) {
+            currentStreamStartTime += windowDurationInSeconds;
+            currentStreamStartTimeStr = dateFormatter(currentStreamStartTime);
 
-    //should there be only next function??
-    public Dataset getAggDataset(Column window) {
-        //TODO: check if window is of data type Window which is a structure of two fields streamStartTime and endTime
-        return slidingDataset.where(window);
+            dataset = dataset.where(col(timeField).$greater$eq(currentStreamStartTime));
+            slidingDataset = slidingDataset.where(col("window.start").$greater$eq(currentStreamStartTimeStr));
+
+            LogHandler.logInfo("[DeletedPreviousWindow][currentStreamStartTime:" + currentStreamStartTimeStr + "]");
+        } else {
+//            LogHandler.logInfo("[!DeletedPreviousWindow][currentStreamStartTime:" + currentStreamStartTimeStr + "][currentStreamEndTime:" + currentStreamEndTimeStr + "]");
+        }
+    }
+
+    private void fetchNextWindow() {
+
+        if ((this.currentStreamEndTime - this.lastQueryTime - this.windowDurationInSeconds) <= ((100 - this.fetchNextWindowsAfterInPercent) / 100 * this.windowDurationInSeconds)) {
+            double currentStreamStartTime = this.currentStreamEndTime - windowDurationInSeconds;
+            double currentStreamEndTime = (currentStreamStartTime + (noOfWindowToFetchAtOnce + 1) * windowDurationInSeconds);
+
+            Dataset<Row> dataset = this.dataset.where(timeField + ">=" + currentStreamStartTime + " and " + timeField + "<" + currentStreamEndTime);
+            Dataset<Row> slidingDataset = null;
+            if (exprs == null)
+                slidingDataset = dataset.groupBy(groupByColumns).agg(expr);
+            else
+                slidingDataset = dataset.groupBy(groupByColumns).agg(expr, exprs);
+            slidingDataset = slidingDataset.where(col("window.start").$greater$eq(dateFormatter(currentStreamStartTime))
+                    .and(col("window.end").$less(dateFormatter(currentStreamEndTime))));
+            this.slidingDataset = this.slidingDataset.union(slidingDataset);
+
+            this.currentStreamEndTime = currentStreamEndTime;
+            this.currentStreamEndTimeStr = dateFormatter(this.currentStreamEndTime);
+
+            LogHandler.logInfo("[FetchedNextWindow][currentStreamEndTime:" + currentStreamEndTimeStr + "]");
+        } else {
+//            LogHandler.logInfo("[!FetchedNextWindow][currentStreamStartTime:" + currentStreamStartTimeStr + "][currentStreamEndTime:" + currentStreamEndTimeStr + "]");
+        }
     }
 
     private String dateFormatter(double time) {

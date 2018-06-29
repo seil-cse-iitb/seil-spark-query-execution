@@ -1,10 +1,14 @@
 import handler.ConfigHandler;
+import handler.LogHandler;
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 import org.apache.spark.sql.*;
-import org.apache.spark.sql.types.DataTypes;
 
+import java.util.ArrayList;
 import java.util.Properties;
+
+import static org.apache.spark.sql.functions.avg;
+import static org.apache.spark.sql.functions.col;
 
 public class OneHourPowerConsumptionComparisonQuery {
 
@@ -35,10 +39,17 @@ public class OneHourPowerConsumptionComparisonQuery {
                 .master("local[*]")
                 .getOrCreate();
 
+        ArrayList<Column> groupByColumns = new ArrayList<Column>();
+        groupByColumns.add(col("sensor_id"));
+        Column[] exprs = new Column[]{avg("V1")};
         Dataset<Row> sch_3 = getRowsByTableName(sparkSession, "sch_3");
-        sch_3 = sch_3.where("TS>=1530037800 and TS<1530055800 and sensor_id='power_k_seil_p'");
+        sch_3 = sch_3.where("TS>=1530037800 and TS<1530055800 and sensor_id in ('power_k_seil_p','power_k_seil_a')");
         DatabaseStream ds = new DatabaseStream(sch_3, "1 hour", "1 minute", "TS", 1,
-                functions.avg("W"), null, null, 1530041400, 75);
+                functions.avg("W"), exprs, groupByColumns, 1530037800, 75);
+
+        LogHandler.logInfo(""+(ds.getAggregatedRows(1530041340)[0]));
+        LogHandler.logInfo(""+(ds.getAggregatedRows(1530041340)[0]));
+        LogHandler.logInfo(""+(ds.getAggregatedRows(1530041400)[0]));
 
 
 //		sch_3.select(functions.window(timestamp,"1 hour","1 minute")).printSchema();
