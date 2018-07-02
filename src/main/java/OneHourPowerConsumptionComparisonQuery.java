@@ -4,11 +4,14 @@ import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 import org.apache.spark.sql.*;
 
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.Properties;
 
-import static org.apache.spark.sql.functions.avg;
-import static org.apache.spark.sql.functions.col;
+import static org.apache.spark.sql.functions.*;
 
 public class OneHourPowerConsumptionComparisonQuery {
 
@@ -43,16 +46,38 @@ public class OneHourPowerConsumptionComparisonQuery {
         groupByColumns.add(col("sensor_id"));
         Column[] exprs = new Column[]{avg("V1")};
         Dataset<Row> sch_3 = getRowsByTableName(sparkSession, "sch_3");
-        sch_3 = sch_3.where("TS>=1530037800 and TS<1530055800 and sensor_id in ('power_k_seil_p','power_k_seil_a')");
-        DatabaseStream ds = new DatabaseStream(sch_3, "1 hour", "1 minute", "TS", 1,
-                functions.avg("W"), exprs, groupByColumns, 1530037800, 75);
+        sch_3 = sch_3.where("TS>="+tsToSeconds("2018-06-21 00:00:00")+" and TS<"+tsToSeconds("2018-06-30 00:00:00")+" and sensor_id in ('power_k_seil_p','power_k_seil_a')");
+        DatabaseStream ds = new DatabaseStream(sch_3, "1 hour", "1 minute", "TS", 10,
+                avg("W"), exprs, groupByColumns, tsToSeconds("2018-06-21 00:00:00"), 75);
 
-        LogHandler.logInfo(""+(ds.getAggregatedRows(1530041340)[0]));
-        LogHandler.logInfo(""+(ds.getAggregatedRows(1530041340)[0]));
-        LogHandler.logInfo(""+(ds.getAggregatedRows(1530041400)[0]));
+//        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-21 13:00:00"), null)[0]));
+        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-21 6:01:00"), null)[0]));
+        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-21 7:02:00"), null)[0]));
+        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-21 13:10:00"), null)[0]));
+        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-21 13:50:00"), null)[0]));
+        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-21 18:00:00"), null)[0]));
+        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-24 22:51:00"), null)[0]));
+        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-24 03:20:00"), null)[0]));
+        LogHandler.logInfo("" + (ds.getAggregatedRows(tsToSeconds("2018-06-24 14:30:00"), col("sensor_id").equalTo("power_k_seil_a"))[0]));
 
 
-//		sch_3.select(functions.window(timestamp,"1 hour","1 minute")).printSchema();
-//		sch_3.groupBy(functions.col("sensor_id"),functions.window(timestamp,"1 hour","1 minute")).avg("W").sort("window").show(1000,false);
+    }
+
+    private static DateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"); //can be static?
+
+    public static String dateFormatter(double time) {
+        return dateFormatter.format(new Date((long) (time * 1000)));
+    }
+
+    public static Integer tsToSeconds(String timestamp) {
+        if (timestamp == null) return null;
+        try {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+            Date dt = sdf.parse(timestamp);
+            long epoch = dt.getTime();
+            return (int) (epoch / 1000);
+        } catch (ParseException e) {
+            return null;
+        }
     }
 }

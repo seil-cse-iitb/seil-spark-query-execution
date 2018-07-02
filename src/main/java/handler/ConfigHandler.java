@@ -76,4 +76,6 @@ public class ConfigHandler {
 
 	//Common Variables;
 	public final static boolean REPORT_ERROR = true;
+	public final static boolean DEBUG= true;
+
 }

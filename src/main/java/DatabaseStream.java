@@ -1,23 +1,25 @@
+import handler.ConfigHandler;
 import handler.LogHandler;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.functions;
-import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
-import sun.rmi.runtime.Log;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+import org.apache.spark.storage.StorageLevel;
 
+import java.sql.Struct;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 
 import static org.apache.spark.sql.functions.*;
 
 public class DatabaseStream {
-
+    //TODO test it on cluster
 
     private Dataset<Row> dataset;
     private Dataset<Row> slidingDataset;
@@ -58,7 +60,7 @@ public class DatabaseStream {
      * At a specific time, current stream can have max ($noOfWindowToFetchAtOnce + 1) * $windowDuration of data.
      *
      * When I give you $queryTime which is $fetchNextWindowsAfterInPercent% percent of the last window available in stream
-     * i.e. (($currentStreamEndTime - $queryTime) <= ((100 - fetchNextWindowsAfterInPercent) / 100 * $windowDurationInSeconds))
+     * i.e. (this.currentStreamEndTime - lastQueryTime - windowDurationInSeconds) <= ((100 - fetchNextWindowsAfterInPercent) / 100 * windowDurationInSeconds))
      * then fetch the next $noOfWindowToFetchAtOnce windows and union it with $dataset. Also update $currentStreamEndTime as described above.
      *
      * Delete a $windowDuration data when all the data of that window is consumed. i.e. delete $currentStartTime to $currentStartTime + $windowDuration data if $queryTime is > $currentStartTime + $windowDuration and shift $currentStartTime = $currentStartTime + $windowDuration
@@ -79,8 +81,8 @@ public class DatabaseStream {
         this.streamStartTime = streamStartTime;
         this.fetchNextWindowsAfterInPercent = fetchNextWindowsAfterInPercent;
 //some variable intialisation
-        this.windowDurationInSeconds = toSeconds(windowDuration);
-        this.slidingDurationInSeconds = toSeconds(slidingDuration);
+        this.windowDurationInSeconds = durationInSeconds(windowDuration);
+        this.slidingDurationInSeconds = durationInSeconds(slidingDuration);
         this.timestamp = functions.col(timeField).cast(DataTypes.LongType).cast(DataTypes.TimestampType).as("eventTime");
 //some initial calculation
         if (groupByColumns == null) {
@@ -114,28 +116,42 @@ public class DatabaseStream {
             slidingDataset = dataset.groupBy(groupByColumns).agg(expr);
         else
             slidingDataset = dataset.groupBy(groupByColumns).agg(expr, exprs);
+//        slidingDataset.unpersist(false); //TODO see memory usage because of not unpersisting.
         slidingDataset = slidingDataset.where(col("window.start").$greater$eq(currentStreamStartTimeStr)
                 .and(col("window.end").$less(currentStreamEndTimeStr)));
-
+        slidingDataset.persist(StorageLevel.MEMORY_ONLY());
         LogHandler.logInfo("[InitialSlidingDataset][currentStreamStartTime:" + currentStreamStartTimeStr + "][currentStreamEndTime:" + currentStreamEndTimeStr + "]");
         return slidingDataset;
     }
 
-    public Row[] getAggregatedRows(long queryTime) {//queryTime in seconds
+    public Row[] getAggregatedRows(long queryTime, Column where) {//queryTime in seconds
         //should be a atomic function (if different threads access the same object of DatabaseStream at same time than it might give faulty results)
         LogHandler.logInfo("[QueryTime]" + dateFormatter(queryTime));
 
-        Row[] collect = (Row[]) this.slidingDataset.where(col("window.start").equalTo(dateFormatter(queryTime))).collect();
+        //TODO fetch Whatever Query is given if it is not currently calculated.
+        fetchNextWindow(); //First fetch then query if more than $fetchNextWindowsAfterInPercent data from last window is used.
 
+        //  TODO use structure for window column. This might make search faster
+//        StructField[] structFields = {new StructField("start", DataTypes.TimestampType, false, null), new StructField("end", DataTypes.TimestampType, false, null)};
+//        StructType s = new StructType(structFields);
+        Row[] collect = null;
+        if (where == null)
+            collect = (Row[]) this.slidingDataset.where(col("window.start").equalTo(dateFormatter(queryTime))).collect();
+        else
+            collect = (Row[]) this.slidingDataset.where(col("window.start").equalTo(dateFormatter(queryTime)).and(where)).collect();
         this.lastQueryTime = queryTime;
 
-        fetchNextWindow();
         deletePreviousWindow();
 
+        if (ConfigHandler.DEBUG == true && collect.length == 0) {
+            LogHandler.logInfo("[LastQueryTime]" + dateFormatter(this.lastQueryTime));
+            this.slidingDataset.show(200, false);
+        }
         return collect;
     }
 
     private void deletePreviousWindow() {
+        //TODO delete all previous windows. Currently deleting only 1 window if $queryTime is greater than ($currentStreamStartTime + $windowDurationInSeconds)
         //currently optimised for space. Can be optimised for time by not deleting a $windowDuration data instead delete
         // $noOfWindowToFetchAtOnce $windowDuration data at once
         if (lastQueryTime >= (currentStreamStartTime + windowDurationInSeconds)) {
@@ -143,7 +159,9 @@ public class DatabaseStream {
             currentStreamStartTimeStr = dateFormatter(currentStreamStartTime);
 
             dataset = dataset.where(col(timeField).$greater$eq(currentStreamStartTime));
+//            slidingDataset.unpersist(false);
             slidingDataset = slidingDataset.where(col("window.start").$greater$eq(currentStreamStartTimeStr));
+            slidingDataset.persist(StorageLevel.MEMORY_ONLY());
 
             LogHandler.logInfo("[DeletedPreviousWindow][currentStreamStartTime:" + currentStreamStartTimeStr + "]");
         } else {
@@ -153,7 +171,7 @@ public class DatabaseStream {
 
     private void fetchNextWindow() {
 
-        if ((this.currentStreamEndTime - this.lastQueryTime - this.windowDurationInSeconds) <= ((100 - this.fetchNextWindowsAfterInPercent) / 100 * this.windowDurationInSeconds)) {
+        if ((this.currentStreamEndTime - lastQueryTime - windowDurationInSeconds) <= ((100 - fetchNextWindowsAfterInPercent) / 100 * windowDurationInSeconds)) {
             double currentStreamStartTime = this.currentStreamEndTime - windowDurationInSeconds;
             double currentStreamEndTime = (currentStreamStartTime + (noOfWindowToFetchAtOnce + 1) * windowDurationInSeconds);
 
@@ -165,7 +183,9 @@ public class DatabaseStream {
                 slidingDataset = dataset.groupBy(groupByColumns).agg(expr, exprs);
             slidingDataset = slidingDataset.where(col("window.start").$greater$eq(dateFormatter(currentStreamStartTime))
                     .and(col("window.end").$less(dateFormatter(currentStreamEndTime))));
+//            this.slidingDataset.unpersist(false);
             this.slidingDataset = this.slidingDataset.union(slidingDataset);
+            this.slidingDataset.persist(StorageLevel.MEMORY_ONLY());
 
             this.currentStreamEndTime = currentStreamEndTime;
             this.currentStreamEndTimeStr = dateFormatter(this.currentStreamEndTime);
@@ -180,7 +200,7 @@ public class DatabaseStream {
         return dateFormatter.format(new Date((long) (time * 1000)));
     }
 
-    private double toSeconds(String duration) throws Exception {
+    private double durationInSeconds(String duration) throws Exception {
         String[] split = duration.split(" ");
         int value = Integer.parseInt(split[0]);
         if (split[1].equalsIgnoreCase("day")) {
